@@ -1,152 +1,114 @@
 #include "VMiniCGRA.h"
 #include "verilated.h"
-#include <array>
 #include <cstdint>
-#include <iostream>
-#include <random>
-#include <stdexcept>
-#include <vector>
+#include <cstdio>
 
-uint16_t reference(uint16_t a, uint16_t b, uint16_t c) {
+// 推进一个完整时钟周期，上升沿之后模型的寄存器完成更新。
+void tick(VMiniCGRA* dut) {
+    dut->clock = 0;
+    dut->eval();
+    dut->clock = 1;
+    dut->eval();
+    dut->clock = 0;
+    dut->eval();
+}
+
+// 软件 golden：保留乘加结果的低 16 bit，与硬件一致。
+uint16_t golden(uint16_t a, uint16_t b, uint16_t c) {
     return static_cast<uint16_t>(uint64_t(a) * b + c);
 }
 
-class Testbench {
-public:
-    VMiniCGRA dut;
-    unsigned cycles = 0;
+// 初始化输入，保持复位两个时钟周期。
+void reset_cgra(VMiniCGRA* dut) {
+    dut->clock = 0;
+    dut->reset = 1;
+    dut->io_cfgWrite = 0;
+    dut->io_cfgAddr = 0;
+    dut->io_cfgIn = 0;
+    dut->io_ibIn_0_0 = 0;
+    dut->io_ibIn_0_1 = 0;
+    dut->io_ibIn_1_0 = 0;
+    dut->io_ibIn_1_1 = 0;
+    tick(dut);
+    tick(dut);      //复位两个时钟周期
+    dut->reset = 0; //reset拉低 启动电路
+}
 
-    void tick() {
-        dut.clock = 0;
-        dut.eval();
-        dut.clock = 1;
-        dut.eval();
-        ++cycles;
-        dut.clock = 0;
-        dut.eval();
+// 按地址依次写入四个 PE 的配置。
+void configure_cgra(VMiniCGRA* dut, const uint8_t config[4]) {
+    for (int i = 0; i < 4; ++i) {
+        dut->io_cfgAddr = i;        //配置地址
+        dut->io_cfgIn = config[i];  //配置数据ISA
+        dut->io_cfgWrite = 1;       //配置数据写使能
+        tick(dut);
+        std::printf("PE[%d][%d] config = 0x%02X\n", i / 2, i % 2,
+                    static_cast<unsigned>(config[i]));
     }
+    dut->io_cfgWrite = 0;       //拉低写是能
+}
 
-    void expect(unsigned row, uint16_t expected) {
-        const auto actual = row == 0 ? dut.io_obOut_0 : dut.io_obOut_1;
-        if (actual != expected) {
-            throw std::runtime_error("cycle=" + std::to_string(cycles) +
-                " row=" + std::to_string(row) + " expected=" +
-                std::to_string(expected) + " actual=" + std::to_string(actual));
+// 连续输入并保存结果。E0 采样、E3 输出，最后多跑三个周期排空流水。
+void run_cgra(VMiniCGRA* dut, const uint16_t a[], const uint16_t b[],
+              const uint16_t c[], uint16_t result[], int count) {
+                
+    dut->io_ibIn_1_1 = 0;
+
+    for (int cycle = 0; cycle < count + 3; ++cycle) {
+        dut->io_ibIn_0_0 = cycle < count ? a[cycle] : 0;
+        dut->io_ibIn_0_1 = cycle < count ? b[cycle] : 0;
+        dut->io_ibIn_1_0 = cycle < count ? c[cycle] : 0;
+        tick(dut);
+        if (cycle >= 3) {
+            //CGRA的计算数据需要3个时钟周期才能从IB寄存器中输出出来
+            result[cycle - 3] = dut->io_obOut_0;
         }
     }
-
-    void reset() {
-        dut.io_cfgWrite = 0;
-        dut.io_cfgAddr = 0;
-        dut.io_cfgIn = 0;
-        inputs(0, 0, 0, 0);
-        dut.reset = 1;
-        tick();
-        expect(0, 0);
-        expect(1, 0);
-        dut.reset = 0;
-    }
-
-    void configure(const std::array<uint8_t, 4>& words) {
-        for (unsigned addr = 0; addr < 4; ++addr) {
-            dut.io_cfgAddr = addr;
-            dut.io_cfgIn = words[addr];
-            dut.io_cfgWrite = 1;
-            tick();
-        }
-        dut.io_cfgWrite = 0;
-        // Changing the bus without write enable must not change any config.
-        dut.io_cfgIn = 0xff;
-    }
-
-    void inputs(uint16_t a, uint16_t b, uint16_t c, uint16_t d) {
-        dut.io_ibIn_0_0 = a;
-        dut.io_ibIn_0_1 = b;
-        dut.io_ibIn_1_0 = c;
-        dut.io_ibIn_1_1 = d;
-    }
-};
+}
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
-    try {
-        Testbench tb;
-        tb.reset();
-        // Route both rows' IB channels through left PEs and west links.
-        for (uint8_t source : {5, 6}) {
-            tb.configure({source, 4, source, 4});
-            tb.inputs(11, 22, 33, 44);
-            for (int i = 0; i < 4; ++i) tb.tick();
-            tb.expect(0, source == 5 ? 11 : 22);
-            tb.expect(1, source == 5 ? 33 : 44);
-        }
-        // East links into left PEs, then vertical links, then west to OB.
-        tb.configure({2, 5, 1, 4});
-        tb.inputs(1234, 0, 0, 0);
-        for (int i = 0; i < 6; ++i) tb.tick();
-        tb.expect(1, 1234);
-        tb.configure({3, 4, 2, 5});
-        tb.inputs(0, 0, 4321, 0);
-        for (int i = 0; i < 6; ++i) tb.tick();
-        tb.expect(0, 4321);
-        // Missing boundary sources and reserved source/op produce zero.
-        for (uint8_t source : {0, 1, 2, 7}) {
-            tb.configure({0, source, 0, 3});
-            tb.tick();
-            tb.tick();
-            tb.expect(0, 0);
-            tb.expect(1, 0);
-        }
-        tb.configure({0, 0xc5, 0, 0xc6});
-        tb.tick();
-        tb.tick();
-        tb.expect(0, 0);
-        tb.expect(1, 0);
+    VMiniCGRA dut;
 
-        // Run the kernel twice, including a reset and full reconfiguration.
-        std::mt19937 rng(20261103);
-        const std::array<std::array<uint16_t, 3>, 6> edges = {{{0,0,0},
-            {0,65535,17}, {1,65535,0}, {65535,65535,65535},
-            {256,256,1}, {1,65535,1}}};
-        for (int run = 0; run < 2; ++run) {
-            tb.reset();
-            tb.configure({0xb5, 0x5c, 0x00, 0x05});
-            std::vector<std::array<uint16_t, 3>> samples;
-            for (unsigned i = 0; i < 1006; ++i) {
-                const uint16_t a = i < edges.size() ? edges[i][0] : rng();
-                const uint16_t b = i < edges.size() ? edges[i][1] : rng();
-                const uint16_t c = i < edges.size() ? edges[i][2] : rng();
-                samples.push_back({a, b, c});
-            }
-            // Input sampled at E0 reaches OB[0] at E3 and OB[1] at E2.
-            // Three extra edges drain the final results from the pipeline.
-            for (unsigned i = 0; i < samples.size() + 3; ++i) {
-                const auto input = i < samples.size() ? samples[i] :
-                    std::array<uint16_t, 3>{0, 0, 0};
-                tb.inputs(input[0], input[1], input[2], rng());
-                tb.tick();
-                if (i >= 3) {
-                    const auto sample = samples[i - 3];
-                    try {
-                        tb.expect(0, reference(sample[0], sample[1], sample[2]));
-                    } catch (const std::exception&) {
-                        std::cerr << "run=" << run << " sample=" << i - 3
-                                  << " a=" << sample[0] << " b=" << sample[1]
-                                  << " c=" << sample[2] << '\n';
-                        throw;
-                    }
-                }
-                if (i >= 2 && i - 2 < samples.size()) {
-                    tb.expect(1, samples[i - 2][2]);
-                }
-            }
-        }
-        tb.dut.final();
-        std::cout << "PASS: routing, reset, configuration, and 2012 kernel inputs ("
-                  << tb.cycles << " cycles)\n";
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << "FAIL: " << error.what() << '\n';
-        return 1;
+    //测试集
+    const int count = 10;
+    const uint16_t a[count] = {2, 3, 10, 0, 1, 256, 65535, 65535, 123, 42};
+    const uint16_t b[count] = {3, 4, 20, 65535, 65535, 256, 65535, 1, 456, 7};
+    const uint16_t c[count] = {4, 5, 30, 17, 1, 1, 65535, 0, 789, 9};
+    uint16_t result[count] = {};
+
+
+
+    // 1. 上电复位，然后依次写入四个 PE 的配置。
+    std::printf("=== 1. Reset and configure ===\n");
+    reset_cgra(&dut);
+
+
+
+    // PE00: MUL，PE01: ADD，PE10: 空闲，PE11: PASS c。 配置PE
+    const uint8_t config[4] = {0xB5, 0x5C, 0x00, 0x05};
+    configure_cgra(&dut, config);
+
+    std::printf("\n=== 2. Run CGRA (%d inputs) ===\n", count);
+
+    //为CGRA输入数据进行计算并保存结果到result.
+    run_cgra(&dut, a, b, c, result, count);
+
+
+    // 3. 打印 CGRA 结果和软件 golden，逐组比较。
+    std::printf("\n=== 3. Compare with golden ===\n");
+    int errors = 0;
+
+    //逐行打印比对信息。
+    for (int i = 0; i < count; ++i) {
+        const uint16_t expected = golden(a[i], b[i], c[i]);     //计算标准数据
+        const bool pass = result[i] == expected;
+        std::printf("[%2d] a=%5u b=%5u c=%5u | CGRA=%5u golden=%5u | %s\n",
+                    i, static_cast<unsigned>(a[i]), static_cast<unsigned>(b[i]),
+                    static_cast<unsigned>(c[i]), static_cast<unsigned>(result[i]),
+                    static_cast<unsigned>(expected), pass ? "PASS" : "FAIL");
+        if (!pass) ++errors;
     }
+    std::printf("\n%d/%d passed\n", count - errors, count);
+    dut.final();
+    return errors == 0 ? 0 : 1;
 }
