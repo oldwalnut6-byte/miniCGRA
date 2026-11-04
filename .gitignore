@@ -1,0 +1,26 @@
+# sbt / Scala build output
+target/
+project/target/
+project/project/
+
+# Editor and language-server state
+.bloop/
+.metals/
+.bsp/
+.vscode/
+.idea/
+
+# Verilator build output and waveforms
+obj_dir/
+*.vcd
+*.fst
+
+# Intermediate Chisel output (generated Verilog is tracked)
+generated/*.fir
+generated/*.anno.json
+
+# Local agent and machine settings
+.agents/
+.codex/
+.aws/
+project/metals.sbt
